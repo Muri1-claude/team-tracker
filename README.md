@@ -23,6 +23,6 @@ Toggles live under **People & accounts → What interns can see**.
 
 
 ## Setup
-The owner has the step-by-step setup instructions. In short: create a Supabase project, run `supabase/schema.sql`, load the starter data, put the project URL and anon key in `config.js`, turn on GitHub Pages, and keep **Confirm email** on in Supabase Auth.
+The owner has the step-by-step setup instructions. In short: create a Supabase project, run `supabase/schema.sql`, load the starter data, put the project URL and publishable key in `config.js`, turn on GitHub Pages, and keep **Confirm email** on in Supabase Auth.
 
 Never put the Supabase **service_role** key or the database password in this repo.

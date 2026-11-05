@@ -232,6 +232,15 @@ alter table public.settings      enable row level security;
 revoke all on public.people, public.member_emails, public.accounts, public.week_logs,
   public.week_entries, public.payments, public.posts, public.questions, public.settings from anon;
 
+-- Signed-in users get table access explicitly (works even when the project's
+-- "Automatically expose new tables" option is off). The policies below still
+-- decide which rows each person can actually see or change.
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on public.people, public.member_emails, public.accounts,
+  public.week_logs, public.week_entries, public.payments, public.posts, public.questions,
+  public.settings to authenticated;
+grant usage, select on all sequences in schema public to authenticated;
+
 -- people: teammates' names are visible to members; only admin edits
 drop policy if exists people_read  on public.people;
 drop policy if exists people_admin on public.people;
