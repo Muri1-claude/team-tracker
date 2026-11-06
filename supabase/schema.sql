@@ -277,6 +277,35 @@ create policy entries_write on public.week_entries for all to authenticated
   with check (public.is_admin() or (person_id = public.my_person()
     and exists (select 1 from public.accounts a where a.id = account_id and a.person_id = public.my_person())));
 
+-- Paid weeks are locked: once a payment covers a week, only the admin can change
+-- that week's log or entries. (Applies to website users; the dashboard SQL editor
+-- runs as a different role and is not blocked, so the owner can always fix data.)
+create or replace function public.week_is_paid(pid text, wk date) returns boolean
+  language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.payments where person_id = pid and wk = any(weeks)) $$;
+revoke all on function public.week_is_paid(text, date) from public, anon;
+grant execute on function public.week_is_paid(text, date) to authenticated;
+
+create or replace function public.guard_paid_week() returns trigger
+  language plpgsql as $$
+begin
+  if current_user = 'authenticated' and not public.is_admin() then
+    if tg_op in ('UPDATE','DELETE') and public.week_is_paid(old.person_id, old.week) then
+      raise exception 'This week has been paid and is locked. Ask the admin to change it.' using errcode = '42501';
+    end if;
+    if tg_op in ('INSERT','UPDATE') and public.week_is_paid(new.person_id, new.week) then
+      raise exception 'This week has been paid and is locked. Ask the admin to change it.' using errcode = '42501';
+    end if;
+  end if;
+  return coalesce(new, old);
+end $$;
+drop trigger if exists lock_paid_logs on public.week_logs;
+create trigger lock_paid_logs before insert or update or delete on public.week_logs
+  for each row execute function public.guard_paid_week();
+drop trigger if exists lock_paid_entries on public.week_entries;
+create trigger lock_paid_entries before insert or update or delete on public.week_entries
+  for each row execute function public.guard_paid_week();
+
 -- payments: own (or all when share_pay); admin only writes
 drop policy if exists pay_read  on public.payments;
 drop policy if exists pay_admin on public.payments;

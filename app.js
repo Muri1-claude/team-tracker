@@ -230,12 +230,14 @@ function viewLog(){
   if(!people.length) return [h("h1",{},"Weekly log"), h("div",{class:"empty"},S.isAdmin?"No team members yet. Add people and their accounts under People & accounts.":"You don't have any accounts assigned yet.")];
   if(!people.some(p=>p.id===S.logPid)) S.logPid = people.some(p=>p.id===myPid())?myPid():people[0].id;
   const p=person(S.logPid), wk=S.week;
-  const editable=canWriteLog(p.id);
+  const paidLock=!S.isAdmin && !!paidFor(p.id,wk);
+  const editable=canWriteLog(p.id) && !paidLock;
   const doc=weekDoc(p.id,wk)||{pid:p.id,week:wk,mode:"perAccount",entries:{},weekNote:""};
   const thisWeek=iso(mondayOf(new Date()));
   out.push(h("div",{},h("h1",{},"Weekly log"),h("p",{class:"sub"},"Log production, notes and time for each account. Every week is kept.")));
   out.push(personPills(people,p.id,id=>{S.logPid=id;store.set("tat.logPid",id);render();}));
-  if(!editable) out.push(h("div",{class:"banner"},`You're viewing ${p.name}'s log. Only ${p.name} and ${ADMIN()} can change it.`));
+  if(paidLock && canWriteLog(p.id)) out.push(h("div",{class:"banner"},`This week has been paid, so it's locked. Ask ${ADMIN()} if something needs fixing.`));
+  else if(!editable) out.push(h("div",{class:"banner"},`You're viewing ${p.name}'s log. Only ${p.name} and ${ADMIN()} can change it.`));
   const paid=paidFor(p.id,wk);
   out.push(h("div",{class:"row"},
     h("div",{class:"weeknav"},
