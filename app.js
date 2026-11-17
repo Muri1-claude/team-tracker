@@ -3,6 +3,8 @@
 // This file only decides what to *show*; hiding a button here is never the security.
 (() => {
 "use strict";
+// Refuse to run inside another site's frame (stops "clickjacking" overlays).
+if(window.top!==window.self){ document.documentElement.replaceChildren(); throw new Error("Refusing to load in a frame"); }
 
 // ---------- helpers ----------
 function h(tag, props, ...kids){
@@ -54,16 +56,20 @@ const configured=CFG.SUPABASE_URL&&!/PASTE/.test(CFG.SUPABASE_URL)&&CFG.SUPABASE
 const sb=configured&&window.supabase?window.supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY):null;
 
 // ---------- state ----------
-const S={session:null,me:null,isAdmin:false,loaded:false,authMode:"signin",recovery:false,
-  settings:{share_logs:false,share_pay:false,share_hours:true,share_questions:true},
-  people:[],emails:{},accounts:[],weeks:{},hoursRows:[],payments:[],posts:[],questions:[],
-  logPid:store.get("tat.logPid")||"",week:iso(mondayOf(new Date())),view:"log",
-  pending:{},chains:{},qFilter:"open",payPick:{},signed:{}};
+// Everything that came from the database. Wiped on sign-out so nothing from
+// one person's session is left in memory for the next person on the same device.
+const freshData=()=>({me:null,isAdmin:false,loaded:false,
+  settings:{share_logs:false,share_hours:true,share_questions:false},partnerName:"",
+  people:[],emails:{},accounts:[],weeks:{},hoursRows:[],payments:[],paidWeeks:{},posts:[],questions:[],
+  pending:{},chains:{},payPick:{},signed:{},selfTest:null});
+const S={session:null,authMode:"signin",recovery:false,
+  logPid:store.get("tat.logPid")||"",week:iso(mondayOf(new Date())),view:"log",qFilter:"open",...freshData()};
 // Display names come from the database after login, so no real names live in this public code.
 const ADMIN=()=>S.settings.admin_name||"Admin";
-const PARTNER=()=>S.settings.partner_name||"Partner";
+const PARTNER=()=>S.partnerName||"Partner";
 const TEAMNAME=()=>S.settings.team_name||"Team Tracker";
-const ALL_VIEWS=[["log","Weekly log"],["pay","Hours & pay"],["team","For the team"],["partner",()=>"For "+PARTNER(),true],["ask",()=>"Questions for "+ADMIN()],["people","People & accounts",true]];
+// [id, label, adminOnly, hiddenFromTabs]. Admin-only tabs are a convenience: the data behind them is refused by the database for everyone else.
+const ALL_VIEWS=[["log","Weekly log"],["pay",()=>S.isAdmin?"Hours & pay":"Hours"],["team","For the team"],["partner",()=>"For "+PARTNER(),true],["ask",()=>"Questions for "+ADMIN()],["people","People & accounts",true],["selftest","Security check",false,true]];
 const views=()=>ALL_VIEWS.filter(v=>!v[2]||S.isAdmin);
 const activePeople=()=>S.people.filter(p=>!p.archived&&p.role!=="admin").sort((a,b)=>(a.sort??99)-(b.sort??99)||a.name.localeCompare(b.name));
 const person=pid=>S.people.find(p=>p.id===pid);
@@ -74,7 +80,11 @@ const weekDoc=(pid,wk)=>S.weeks[wkey(pid,wk)];
 const myPid=()=>S.me?.person_id||null;
 const canWriteLog=pid=>S.isAdmin||pid===myPid();
 function weekTotal(doc){ if(!doc) return 0; if(doc.mode==="total") return doc.totalMin||0; return Object.values(doc.entries||{}).reduce((s,e)=>s+(+e.min||0),0); }
-function paidFor(pid,wk){ return S.payments.find(p=>p.person_id===pid&&(p.weeks||[]).includes(wk)); }
+// Admin: the payment covering this week. Intern: only "paid on <date>" for their OWN weeks (no amounts ever reach an intern's browser).
+function paidFor(pid,wk){
+  if(S.isAdmin) return S.payments.find(p=>p.person_id===pid&&(p.weeks||[]).includes(wk));
+  return pid===myPid()&&wk in S.paidWeeks?{paid_on:S.paidWeeks[wk],label:""}:undefined;
+}
 function lastThrough(pid,accId,wk){
   const ks=Object.keys(S.weeks).filter(k=>k.startsWith(pid+"__")&&k.split("__")[1]<wk).sort().reverse();
   for(const k of ks){const t=S.weeks[k].entries?.[accId]?.through; if(t) return t;}
@@ -98,15 +108,22 @@ async function loadAll(){
     if(who.error) throw who.error;
     S.me=(who.data||[])[0]||null; S.isAdmin=S.me?.role==="admin";
     if(!S.me){S.loaded=true;return;}
-    const [st,ppl,acc,logs,ents,pays,posts,qs,hrsR,em]=await Promise.all([
+    // Interns never ask for payments, emails or admin settings (and the database would refuse anyway).
+    const none=Promise.resolve({data:[]});
+    const [st,ppl,acc,logs,ents,pays,posts,qs,hrsR,em,ast,paid]=await Promise.all([
       sb.from("settings").select("*").eq("id",1).maybeSingle(),
       fetchAll("people"),fetchAll("accounts"),fetchAll("week_logs"),fetchAll("week_entries"),
-      fetchAll("payments"),fetchAll("posts"),fetchAll("questions"),
+      S.isAdmin?fetchAll("payments"):[],fetchAll("posts"),fetchAll("questions"),
       sb.rpc("team_hours"),
-      S.isAdmin?sb.from("member_emails").select("*"):Promise.resolve({data:[]})]);
+      S.isAdmin?sb.from("member_emails").select("*"):none,
+      S.isAdmin?sb.from("admin_settings").select("*").eq("id",1).maybeSingle():none,
+      S.isAdmin?none:sb.rpc("my_paid_weeks")]);
+    if(st.error) throw st.error; if(hrsR.error) throw hrsR.error;
     if(st.data) S.settings=st.data;
+    S.partnerName=ast.data?.partner_name||"";
     S.people=ppl; S.accounts=acc; S.payments=pays; S.posts=posts; S.questions=qs;
     S.hoursRows=hrsR.data||[];
+    S.paidWeeks={}; (paid.data||[]).forEach(r=>S.paidWeeks[r.week]=r.paid_on||"");
     S.emails={}; (em.data||[]).forEach(r=>S.emails[r.person_id]=r.email);
     const weeks={};
     for(const l of logs){ weeks[wkey(l.person_id,l.week)]={pid:l.person_id,week:l.week,mode:l.mode,totalMin:l.total_min,weekNote:l.week_note||"",imported:l.imported,updatedAt:l.updated_at,updatedBy:l.updated_by,entries:{}}; }
@@ -132,9 +149,9 @@ function renderHeader(){
     who.replaceChildren(S.session?h("button",{class:"ghost",onclick:signOut},"Sign out"):"");
     return;
   }
-  who.replaceChildren(h("span",{},S.me.name+(S.isAdmin?" (admin)":"")),h("button",{class:"ghost",onclick:signOut},"Sign out"));
+  who.replaceChildren(h("span",{},S.me.name+(S.isAdmin?" (admin)":"")),h("button",{class:"ghost",onclick:changePassword},"Password"),h("button",{class:"ghost",onclick:signOut},"Sign out"));
   const openQ=S.questions.filter(q=>q.status!=="answered").length;
-  tabs.replaceChildren(...views().map(([id,label])=>h("a",{href:"#"+id,"aria-current":S.view===id?"page":null},typeof label==="function"?label():label, id==="ask"&&openQ&&S.isAdmin?h("span",{class:"count"},openQ):null)));
+  tabs.replaceChildren(...views().filter(v=>!v[3]).map(([id,label])=>h("a",{href:"#"+id,"aria-current":S.view===id?"page":null},typeof label==="function"?label():label, id==="ask"&&openQ&&S.isAdmin?h("span",{class:"count"},openQ):null)));
 }
 function render(){
   renderHeader();
@@ -147,7 +164,9 @@ function render(){
   else if(!S.me) content=viewNotOnTeam();
   else {
     if(!views().some(v=>v[0]===S.view)) S.view="log";
-    content=({log:viewLog,pay:viewPay,team:()=>viewBoard("team"),partner:()=>viewBoard("partner"),ask:viewAsk,people:viewPeople})[S.view]();
+    content=({log:viewLog,pay:viewPay,team:()=>viewBoard("team"),partner:()=>viewBoard("partner"),ask:viewAsk,people:viewPeople,selftest:viewSelfTest})[S.view]();
+    // Nudge people still on the temporary password the admin gave them.
+    if(!S.isAdmin&&!S.session.user?.user_metadata?.pw_set) content=[h("div",{class:"banner row"},h("span",{style:"flex:1 1 200px"},"You're still using the temporary password you were given. Set your own now."),h("button",{onclick:changePassword},"Set my password"))].concat(content);
   }
   const y=window.scrollY;
   main.replaceChildren(...[].concat(content));
@@ -158,12 +177,12 @@ function render(){
 // ----- auth screens -----
 function viewNotConfigured(){
   return h("div",{class:"panel pad form",style:"max-width:560px"},h("h1",{},"Almost there"),
-    h("p",{class:"sub"},"This site isn't connected to its database yet. Open config.js in the GitHub repo and paste in the Supabase project URL and anon key (see README, step 3)."));
+    h("p",{class:"sub"},"This site isn't connected to its database yet. Open config.js in the GitHub repo and paste in the Supabase project URL and publishable key (see SETUP.md)."));
 }
 function viewLogin(){
   const m=S.authMode;
   const email=h("input",{type:"email",id:"lgEmail",autocomplete:"email",placeholder:"you@example.com",value:store.get("tat.email")||""});
-  const pw=h("input",{type:"password",id:"lgPw",autocomplete:m==="signup"?"new-password":"current-password",placeholder:m==="signup"?"Choose a password (8+ characters)":"Password"});
+  const pw=h("input",{type:"password",id:"lgPw",autocomplete:m==="signup"?"new-password":"current-password",placeholder:m==="signup"?`Choose a password (${PW_MIN}+ characters)`:"Password"});
   const msg=h("div",{class:"status",id:"lgMsg"});
   async function go(ev){
     ev.preventDefault(); msg.textContent="";
@@ -174,9 +193,9 @@ function viewLogin(){
     try{
       if(m==="reset"){
         const {error}=await sb.auth.resetPasswordForEmail(e,{redirectTo:redirect}); if(error) throw error;
-        msg.textContent="If that email is on the team, a reset link is on its way. Open it on this device.";
+        msg.textContent="If that email has an account and email delivery is set up, a reset link is on its way. No email after a few minutes? Ask your admin to reset your password.";
       }else if(m==="signup"){
-        if(pw.value.length<8){msg.textContent="Use at least 8 characters.";return;}
+        if(pw.value.length<PW_MIN){msg.textContent=`Use at least ${PW_MIN} characters.`;return;}
         const {data,error}=await sb.auth.signUp({email:e,password:pw.value,options:{emailRedirectTo:redirect}}); if(error) throw error;
         msg.textContent=data.session?"Account created.":"Check your email and click the confirmation link, then sign in here.";
       }else{
@@ -189,31 +208,45 @@ function viewLogin(){
   return h("div",{class:"login"},
     h("form",{class:"panel pad form",onsubmit:go},
       h("h1",{},m==="signup"?"Create your account":m==="reset"?"Reset your password":"Sign in"),
-      h("p",{class:"sub"},m==="signup"?"Use the email your admin added you with.":"Team members only."),
+      h("p",{class:"sub"},m==="signup"?"Use the email your admin added you with.":m==="reset"?"We'll email you a link to set a new password.":"Team members only. Your admin creates your account and gives you a temporary password."),
       h("label",{class:"label",for:"lgEmail"},"Email"),email,
       m!=="reset"?[h("label",{class:"label",for:"lgPw"},"Password"),pw]:null,
       btn,msg,
       h("div",{class:"row",style:"gap:4px"},
         m!=="signin"?h("button",{type:"button",class:"ghost",onclick:()=>{S.authMode="signin";render();}},"Back to sign in"):null,
-        m==="signin"?h("button",{type:"button",class:"ghost",onclick:()=>{S.authMode="signup";render();}},"First time? Create account"):null,
+        m==="signin"&&CFG.ALLOW_SIGNUP===true?h("button",{type:"button",class:"ghost",onclick:()=>{S.authMode="signup";render();}},"First time? Create account"):null,
         m==="signin"?h("button",{type:"button",class:"ghost",onclick:()=>{S.authMode="reset";render();}},"Forgot password"):null)));
 }
-function viewSetPassword(){
-  const pw=h("input",{type:"password",id:"npw",autocomplete:"new-password",placeholder:"New password (8+ characters)"});
+const PW_MIN=10;
+function passwordForm(title,onDone,onCancel){
+  const pw=h("input",{type:"password",id:"npw",autocomplete:"new-password",placeholder:`New password (${PW_MIN}+ characters)`});
+  const pw2=h("input",{type:"password",id:"npw2",autocomplete:"new-password",placeholder:"Type it again"});
   const msg=h("div",{class:"status"});
-  return h("div",{class:"login"},h("form",{class:"panel pad form",onsubmit:async ev=>{ev.preventDefault();
-      if(pw.value.length<8){msg.textContent="Use at least 8 characters.";return;}
-      const {error}=await sb.auth.updateUser({password:pw.value});
+  return h("form",{class:"panel pad form",style:"max-width:400px;width:100%",onsubmit:async ev=>{ev.preventDefault();
+      if(pw.value.length<PW_MIN){msg.textContent=`Use at least ${PW_MIN} characters.`;return;}
+      if(pw.value!==pw2.value){msg.textContent="The two passwords don't match.";return;}
+      const {data,error}=await sb.auth.updateUser({password:pw.value,data:{pw_set:true}});
       if(error){msg.textContent=error.message;return;}
-      S.recovery=false; toast("Password updated"); history.replaceState(null,"",location.pathname); await refresh();}},
-    h("h1",{},"Set a new password"),pw,h("button",{class:"primary",type:"submit"},"Save password"),msg));
+      if(data?.user&&S.session) S.session={...S.session,user:data.user};
+      toast("Password updated"); onDone();}},
+    h("h1",{},title),h("p",{class:"sub"},"Pick one you don't use anywhere else."),pw,pw2,
+    h("div",{class:"row"},h("button",{class:"primary",type:"submit"},"Save password"),onCancel?h("button",{class:"ghost",type:"button",onclick:onCancel},"Cancel"):null),msg);
+}
+function viewSetPassword(){
+  return h("div",{class:"login"},passwordForm("Set a new password",async()=>{S.recovery=false;history.replaceState(null,"",location.pathname);await refresh();}));
+}
+function changePassword(){
+  const dlg=h("div",{class:"overlay",onclick:e=>{if(e.target===dlg)dlg.remove();}});
+  dlg.append(passwordForm("Change your password",()=>{dlg.remove();render();},()=>dlg.remove()));
+  document.body.append(dlg); dlg.querySelector("input").focus();
 }
 function viewNotOnTeam(){
   return h("div",{class:"panel pad form",style:"max-width:560px"},h("h1",{},"You're not on the team list yet"),
     h("p",{class:"sub"},`You're signed in as ${S.session?.user?.email||"this account"}, but that email hasn't been added to the tracker. Ask ${ADMIN()} to add it under People & accounts, then refresh this page.`),
     h("div",{class:"row"},h("button",{onclick:refresh},"Refresh"),h("button",{class:"ghost",onclick:signOut},"Sign out")));
 }
-async function signOut(){ await sb.auth.signOut(); S.me=null;S.isAdmin=false;S.loaded=false;S.weeks={};S.payments=[];S.posts=[];S.questions=[];S.people=[];S.accounts=[];render(); }
+function wipe(){ for(const k of Object.keys(S.pending)) if(k.startsWith("t_")) clearTimeout(S.pending[k]); Object.assign(S,freshData()); document.querySelectorAll(".overlay").forEach(x=>x.remove()); }
+async function signOut(){ try{await sb.auth.signOut();}catch(e){console.error(e);} wipe(); S.session=null; render(); }
 
 // ----- weekly log -----
 function logPeople(){
@@ -246,7 +279,7 @@ function viewLog(){
       h("button",{class:"ghost","aria-label":"Next week",onclick:()=>{S.week=addDays(wk,7);render();}},"›"),
       wk!==thisWeek?h("button",{class:"ghost",onclick:()=>{S.week=thisWeek;render();}},"This week"):null),
     h("span",{class:"spacer"}),
-    paid?h("span",{class:"chip ok"},"Paid · "+(paid.paid_on?fmtShort(paid.paid_on):paid.label)):(weekTotal(doc)>0&&(S.isAdmin||p.id===myPid()||S.settings.share_pay)?h("span",{class:"chip warn"},"Not paid yet"):null),
+    paid?h("span",{class:"chip ok"},"Paid · "+(paid.paid_on?fmtShort(paid.paid_on):paid.label)):(weekTotal(doc)>0&&(S.isAdmin||p.id===myPid())?h("span",{class:"chip warn"},"Not paid yet"):null),
     editable?h("div",{class:"seg",role:"group","aria-label":"How to log time"},
       h("button",{"aria-pressed":String(doc.mode!=="total"),onclick:()=>{editWeek(p.id,wk,d=>d.mode="perAccount");render();}},"Time per account"),
       h("button",{"aria-pressed":String(doc.mode==="total"),onclick:()=>{editWeek(p.id,wk,d=>{if(d.mode!=="total"&&!d.totalMin)d.totalMin=weekTotal(d)||null;d.mode="total";});render();}},"Weekly total only")):null
@@ -309,7 +342,7 @@ function flushWeek(key){
   S.chains[key]=prev.then(async()=>{
     const d=S.weeks[key]; const n=S.pending[key]; const stamp=new Date().toISOString();
     const st=()=>document.getElementById("saveStatus");
-    const r1=await sb.from("week_logs").upsert({person_id:d.pid,week:d.week,mode:d.mode,total_min:d.totalMin??null,week_note:d.weekNote||"",updated_at:stamp,updated_by:myPid()});
+    const r1=await sb.from("week_logs").upsert({person_id:d.pid,week:d.week,mode:d.mode,total_min:d.totalMin??null,week_note:d.weekNote||""}); // the database stamps who saved it and when
     if(r1.error){delete S.pending[key];fail(r1.error,"Weekly log");if(st())st().textContent="Not saved";return;}
     const mine=new Set(accountsOf(d.pid).map(a=>a.id));
     const rows=Object.entries(d.entries||{}).filter(([aid])=>S.isAdmin?S.accounts.some(a=>a.id===aid):mine.has(aid))
@@ -336,10 +369,11 @@ function hoursFor(pid){
   return [...m.entries()].filter(([,v])=>v>0).sort((a,b)=>b[0].localeCompare(a[0]));
 }
 function viewPay(){
-  const out=[h("div",{},h("h1",{},"Hours & pay"),h("p",{class:"sub"},S.isAdmin?"Logged hours by week, and which weeks you've paid.":"Logged hours by week, and which of your weeks "+ADMIN()+" has paid."))];
+  const out=[h("div",{},h("h1",{},S.isAdmin?"Hours & pay":"Hours"),h("p",{class:"sub"},S.isAdmin?"Logged hours by week, and which weeks you've paid.":"Logged hours by week, and which of your weeks "+ADMIN()+" has marked as paid."))];
   const everyone=activePeople();
   const hourPeople=everyone.filter(p=>S.isAdmin||p.id===myPid()||S.hoursRows.some(r=>r.person_id===p.id));
-  const seesPay=pid=>S.isAdmin||pid===myPid()||S.settings.share_pay;
+  // Paid / unpaid status: admin for everyone, interns for their own weeks only. Amounts: admin only.
+  const seesPay=pid=>S.isAdmin||pid===myPid();
   if(!hourPeople.length) return out.concat(h("div",{class:"empty"},"No hours logged yet."));
   out.push(h("div",{class:"grid2"},hourPeople.map(p=>{
     const wks=hoursFor(p.id); const total=wks.reduce((s,[,v])=>s+v,0);
@@ -347,8 +381,9 @@ function viewPay(){
     if(seesPay(p.id)){
       const unpaid=wks.filter(([w])=>!paidFor(p.id,w)); const um=unpaid.reduce((s,[,v])=>s+v,0);
       const last=S.payments.filter(x=>x.person_id===p.id).sort((a,b)=>(b.paid_on||b.created_at||"").localeCompare(a.paid_on||a.created_at||""))[0];
-      card.append(h("div",{class:"row"},h("span",{class:"big"},hrs(um)+" h"),um>0?h("span",{class:"chip warn"},unpaid.length+" unpaid wk"):h("span",{class:"chip ok"},"All paid")),
-        h("div",{class:"hint"},last?"Last payment: "+(money(last.amount)||"amount not recorded")+" · "+(last.paid_on?fmtLong(last.paid_on):last.label):"No payments yet"));
+      card.append(h("div",{class:"row"},h("span",{class:"big"},hrs(um)+" h"),um>0?h("span",{class:"chip warn"},unpaid.length+" unpaid wk"):h("span",{class:"chip ok"},"All paid")));
+      if(S.isAdmin) card.append(h("div",{class:"hint"},last?"Last payment: "+(money(last.amount)||"amount not recorded")+" · "+(last.paid_on?fmtLong(last.paid_on):last.label):"No payments yet"));
+      else card.append(h("div",{class:"hint"},"Hours not yet marked paid"));
     }else{
       card.append(h("div",{class:"row"},h("span",{class:"big"},hrs(total)+" h"),h("span",{class:"chip mute"},wks.length+" wk logged")),
         h("div",{class:"hint"},wks[0]?"Latest week: "+fmtShort(wks[0][0])+" · "+hrs(wks[0][1])+" h":"No hours logged yet"));
@@ -391,7 +426,7 @@ function viewPay(){
       h("p",{class:"sub",style:"margin:0"},picked.length?`${picked.length} week${picked.length>1?"s":""} selected · ${hm(pm)} · ${hrs(pm)} h`:"Tick the unpaid weeks above that this payment covers."),
       h("div",{class:"row"},amt,dt,nt),h("div",{class:"row"},btn)));
   }
-  if(showPay){
+  if(S.isAdmin){
     const hist=S.payments.filter(x=>x.person_id===pid).sort((a,b)=>(b.paid_on||b.created_at||"").localeCompare(a.paid_on||a.created_at||""));
     out.push(h("h2",{class:"grouphead"},"Payment history"));
     if(!hist.length) out.push(h("div",{class:"empty"},"No payments recorded for "+nameOf(pid)+"."));
@@ -407,7 +442,7 @@ function viewPay(){
       t.append(b); out.push(h("div",{class:"panel tblwrap"},t));
     }
   }else{
-    out.push(h("p",{class:"hint"},"Payment details are private to each person."));
+    out.push(h("p",{class:"hint"},"Payment amounts are kept private by "+ADMIN()+" and aren't shown here."));
   }
   return out;
 }
@@ -445,7 +480,10 @@ function imgEl(path){
   else sb.storage.from("attachments").createSignedUrl(path,3600).then(({data,error})=>{ if(error||!data){img.alt="Screenshot unavailable";return;} S.signed[path]={url:data.signedUrl,exp:Date.now()+50*60e3}; set(data.signedUrl); });
   return a;
 }
+const IMG_TYPES=["image/png","image/jpeg","image/gif","image/webp"], IMG_MAX=10*1024*1024;
 async function uploadImage(file,folder){
+  if(!IMG_TYPES.includes(file.type)) throw new Error("Only PNG, JPEG, GIF or WebP images can be attached.");
+  if(file.size>IMG_MAX) throw new Error("That image is over 10 MB. Crop it or take a smaller screenshot.");
   const ext=(file.type.split("/")[1]||"png").replace(/[^a-z0-9]/gi,"").slice(0,5)||"png";
   const path=`${folder}/${uid()}.${ext}`;
   const {error}=await sb.storage.from("attachments").upload(path,file,{contentType:file.type||"image/png"});
@@ -453,7 +491,7 @@ async function uploadImage(file,folder){
 }
 function attachPicker(holder,folder,ta){
   const lab=h("span",{class:"hint",style:"margin:0"});
-  const doUpload=async f=>{ lab.textContent="Uploading…"; try{holder.path=await uploadImage(f,folder);lab.textContent="Screenshot attached";}catch(e){console.error(e);lab.textContent="Upload failed";} };
+  const doUpload=async f=>{ lab.textContent="Uploading…"; try{holder.path=await uploadImage(f,folder);lab.textContent="Screenshot attached";}catch(e){console.error(e);lab.textContent=/^(Only|That image)/.test(e.message)?e.message:"Upload failed";} };
   const inp=h("input",{type:"file",accept:"image/*","aria-label":"Attach a screenshot",onchange:ev=>{const f=ev.target.files[0];if(f)doUpload(f);}});
   if(ta) ta.addEventListener("paste",ev=>{const it=[...(ev.clipboardData?.items||[])].find(i=>i.type.startsWith("image/"));if(!it)return;ev.preventDefault();doUpload(it.getAsFile());});
   return h("div",{class:"row"},h("span",{class:"btn filebtn"},"Attach screenshot",inp),lab,ta?h("span",{class:"hint",style:"margin:0"},"or paste one into the text box"):null);
@@ -564,16 +602,17 @@ function viewPeople(){
     h("input",{type:"checkbox",id:"set-"+key,checked:!!s[key],onchange:async ev=>{const v=ev.target.checked;const {error}=await sb.from("settings").update({[key]:v}).eq("id",1);if(error){ev.target.checked=!v;return fail(error,"Setting");}S.settings={...S.settings,[key]:v};toast("Saved");}}),
     h("span",{},h("strong",{},label),h("span",{class:"hint",style:"display:block;margin:0"},desc)));
   out.push(h("div",{class:"panel pad form"},h("h2",{},"What interns can see"),
-    h("p",{class:"hint",style:"margin:0"},"Interns always see their own accounts, logs, payments and questions, plus the For the team board. They never see For "+PARTNER()+", this page, or anyone's email."),
+    h("p",{class:"hint",style:"margin:0"},"Interns always see their own accounts, logs and questions, whether each of their own weeks is paid, and the For the team board. They never see pay amounts, For "+PARTNER()+", this page, or anyone's email. No switch here changes that; the database enforces it."),
     h("div",{class:"settings"},
       tog("share_hours","Everyone's weekly hours","Interns see each other's hour totals by week. No notes or pay."),
       tog("share_logs","Everyone's accounts and logs","Interns can read each other's accounts, notes and times (read only)."),
-      tog("share_pay","Everyone's payments","Interns see what each person was paid."),
       tog("share_questions","Everyone's questions","Interns see each other's questions and your answers."))));
   const nmField=(key,label)=>h("label",{class:"form",style:"gap:4px",for:"nm-"+key},h("span",{class:"label"},label),h("input",{id:"nm-"+key,value:s[key]||"",onchange:async ev=>{const v=ev.target.value.trim();if(!v)return;const {error}=await sb.from("settings").update({[key]:v}).eq("id",1);if(error)return fail(error,"Name");S.settings={...S.settings,[key]:v};toast("Saved");render();}}));
+  // The partner's name is stored in an admin-only table, so interns can't read it.
+  const partnerField=h("label",{class:"form",style:"gap:4px",for:"nm-partner"},h("span",{class:"label"},"Partner board name (only you see this)"),h("input",{id:"nm-partner",value:S.partnerName||"",onchange:async ev=>{const v=ev.target.value.trim();if(!v)return;const {error}=await sb.from("admin_settings").update({partner_name:v}).eq("id",1);if(error)return fail(error,"Name");S.partnerName=v;toast("Saved");render();}}));
   out.push(h("div",{class:"panel pad form"},h("h2",{},"Display names"),
-    h("p",{class:"hint",style:"margin:0"},"Shown only to signed-in team members. They're stored in the database, not in the site's public code."),
-    h("div",{class:"settings"},nmField("team_name","Site name"),nmField("admin_name","Your name (admin)"),nmField("partner_name","Partner board name"))));
+    h("p",{class:"hint",style:"margin:0"},"Stored in the database, not in the site's public code. The site name and your name are shown to signed-in team members."),
+    h("div",{class:"settings"},nmField("team_name","Site name"),nmField("admin_name","Your name (admin)"),partnerField)));
   const people=activePeople();
   const nm=h("input",{id:"newPerson",placeholder:"Name"});
   const em=h("input",{id:"newEmail",type:"email",placeholder:"Login email"});
@@ -583,9 +622,10 @@ function viewPeople(){
       const id=n.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,20)+"-"+Math.random().toString(36).slice(2,6);
       const r=await sb.from("people").insert({id,name:n,role:"intern",sort:people.length+1}); if(r.error) return fail(r.error,"Person");
       if(e){const r2=await sb.from("member_emails").insert({person_id:id,email:e}); if(r2.error) fail(r2.error,"Email");}
-      toast(n+" added"+(e?". They can now create an account with "+e:"")); refresh();
+      toast(n+" added"+(e?". Now create their login for "+e+" in Supabase (see SETUP.md)":"")); refresh();
     }},"Add")),
-    h("p",{class:"hint",style:"margin:0"},"Once their email is here, they go to this site, click “First time? Create account”, and sign up with that exact email.")));
+    h("p",{class:"hint",style:"margin:0"},"Adding someone here puts them on the team list. They also need a login: create it in the Supabase dashboard (Authentication > Users > Add user) with this exact email and a temporary password. SETUP.md has the steps."),
+    h("p",{class:"hint",style:"margin:0"},h("a",{href:"#selftest"},"Security check"),": sign in as a test intern and open this page to confirm the restricted data is refused.")));
   if(!people.length) out.push(h("div",{class:"empty"},"No team members yet."));
   for(const p of people) out.push(personPanel(p,people));
   const archived=S.people.filter(p=>p.archived);
@@ -626,6 +666,59 @@ function personPanel(p,people){
   return panel;
 }
 
+// ----- security check -----
+// Tries, from this browser and this login, to read and change things interns must
+// never reach, by calling the database directly. Meant to be run from a TEST INTERN
+// account. It only reports whether each attempt was refused; it shows no data.
+async function runSelfTest(){
+  const res=[]; const add=(name,ok,detail)=>res.push({name,ok,detail});
+  // "Refused" means the database said no (permission denied / no such thing for you). Any other error is treated as a failure, to be safe.
+  const refused=e=>!!e&&["42501","42703","42883","PGRST202","PGRST204"].includes(e.code);
+  const judge=(name,{data,error},leak)=>{ const n=Array.isArray(data)?data.length:(data==null?0:1);
+    if(error) add(name,refused(error),refused(error)?"refused":"unclear error: "+(error.message||error.code));
+    else add(name,n===0,n?leak+" ("+n+")":"nothing came back"); };
+  // --- reading ---
+  judge("Read payments (amounts)",await sb.from("payments").select("*").limit(5),"READABLE: rows came back");
+  judge("Read partner board posts",await sb.from("posts").select("*").eq("board","partner").limit(5),"READABLE: rows came back");
+  judge("Read the partner's name",await sb.from("admin_settings").select("*"),"READABLE: rows came back");
+  judge("Read the partner's name (old location)",await sb.from("settings").select("partner_name"),"READABLE: rows came back");
+  judge("Read login emails",await sb.from("member_emails").select("*").limit(5),"READABLE: rows came back");
+  judge("Read removed team members",await sb.from("people").select("*").eq("archived",true).limit(5),"READABLE: rows came back");
+  judge("List partner board screenshots",await sb.storage.from("attachments").list("partner",{limit:5}),"READABLE: files listed");
+  judge("Ask the database whether a given week was paid",await sb.rpc("week_is_paid",{pid:myPid(),wk:S.week}),"ANSWERED");
+  { const {data,error}=await sb.rpc("my_paid_weeks"); const extra=[...new Set((data||[]).flatMap(r=>Object.keys(r)))].filter(k=>k!=="week"&&k!=="paid_on");
+    add("My own paid weeks carry only the week and the date",!error&&!extra.length,error?"error: "+error.message:extra.length?"EXTRA FIELDS: "+extra.join(", "):"ok"); }
+  // --- changing (each attempt is a no-op or clearly labelled, in case it ever gets through) ---
+  judge("Edit the people list",await sb.from("people").update({archived:false}).eq("id",myPid()).select(),"CHANGED rows");
+  judge("Flip a sharing switch",await sb.from("settings").update({share_logs:S.settings.share_logs}).eq("id",1).select(),"CHANGED rows");
+  judge("Edit payments",await sb.from("payments").update({imported:false}).eq("imported",false).select(),"CHANGED rows");
+  judge("Edit login emails",await sb.from("member_emails").update({person_id:myPid()}).eq("person_id",myPid()).select(),"CHANGED rows");
+  judge("Edit the partner's name",await sb.from("admin_settings").update({id:1}).eq("id",1).select(),"CHANGED rows");
+  const pay=await sb.from("payments").insert({person_id:myPid(),weeks:[],amount:0,note:"security check (safe to delete)"}).select();
+  judge("Add a payment",pay,"ADDED a row"); if(pay.data?.length) await sb.from("payments").delete().eq("id",pay.data[0].id);
+  const post=await sb.from("posts").insert({board:"partner",body:"security check (safe to delete)"}).select();
+  judge("Post to the partner board",post,"ADDED a row"); if(post.data?.length) await sb.from("posts").delete().eq("id",post.data[0].id);
+  S.selfTest=res; render();
+}
+function viewSelfTest(){
+  const out=[h("div",{},h("h1",{},"Security check"),h("p",{class:"sub"},"Tries to read and change restricted data straight from the database, as the person signed in right now."))];
+  if(S.isAdmin){
+    out.push(h("div",{class:"banner"},"You're signed in as the admin, so you are allowed to see everything and this check doesn't apply. Sign in as a test intern and open this page again (add #selftest to the site address)."));
+    out.push(h("div",{class:"panel pad form"},h("h2",{},"Before you test as an intern"),
+      h("p",{class:"hint",style:"margin:0"},"“An intern gets nothing back” only proves something if there is something to hide. Right now the database holds:"),
+      h("div",{class:"row"},h("span",{class:"chip "+(S.payments.length?"ok":"warn")},S.payments.length+" payments"),h("span",{class:"chip "+(S.posts.some(p=>p.board==="partner")?"ok":"warn")},S.posts.filter(p=>p.board==="partner").length+" partner posts"),h("span",{class:"chip "+(Object.keys(S.emails).length?"ok":"warn")},Object.keys(S.emails).length+" login emails")),
+      h("p",{class:"hint",style:"margin:0"},"If any of these is 0, add a made-up one first (a fake $1 payment to the test intern, a test partner post).")));
+    return out;
+  }
+  out.push(h("div",{class:"row"},h("button",{class:"primary",onclick:async ev=>{ev.target.disabled=true;ev.target.textContent="Checking…";try{await runSelfTest();}catch(e){console.error(e);toast("The check couldn't finish. Try again.");render();}}},S.selfTest?"Run again":"Run the check")));
+  if(S.selfTest){
+    const bad=S.selfTest.filter(r=>!r.ok).length;
+    out.push(h("div",{class:"banner",style:bad?"background:var(--danger-weak);color:var(--danger)":"background:var(--accent-weak);color:var(--accent)"},bad?bad+" check(s) FAILED. Do not enter real pay data. Re-run supabase/schema.sql in Supabase and try again.":"All "+S.selfTest.length+" checks passed. This account cannot reach pay, the partner board, or people & emails."));
+    out.push(h("div",{class:"panel tblwrap"},h("table",{},h("thead",{},h("tr",{},h("th",{},"Attempt"),h("th",{},"Result"),h("th",{},"Detail"))),h("tbody",{},S.selfTest.map(r=>h("tr",{},h("td",{},r.name),h("td",{},h("span",{class:"chip "+(r.ok?"ok":"warn")},r.ok?"Pass":"FAILED")),h("td",{},r.detail)))))));
+  }
+  return out;
+}
+
 // ---------- routing & boot ----------
 function route(){const v=(location.hash||"").slice(1);if(ALL_VIEWS.some(x=>x[0]===v))S.view=v;render();}
 window.addEventListener("hashchange",route);
@@ -638,8 +731,8 @@ async function boot(){
   sb.auth.onAuthStateChange((event,session)=>{
     const was=S.session?.user?.id; S.session=session;
     if(event==="PASSWORD_RECOVERY"){S.recovery=true;render();return;}
-    if(session&&session.user.id!==was){S.loaded=false;render();refresh();}
-    else if(!session){S.me=null;S.loaded=false;render();}
+    if(session&&session.user.id!==was){wipe();render();refresh();}
+    else if(!session){wipe();render();}
   });
   const {data}=await sb.auth.getSession(); S.session=data.session;
   render(); if(S.session) refresh();
