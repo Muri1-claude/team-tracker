@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<!-- Only this site's own scripts may run, and the page may only talk to Supabase. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.supabase.co; connect-src https://*.supabase.co wss://*.supabase.co; base-uri 'none'; form-action 'none'; object-src 'none'">
 <title>Team Tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -165,7 +168,8 @@ input:disabled,textarea:disabled,button:disabled{cursor:not-allowed}
 </header>
 <main class="wrap" id="main"><div class="empty">Loading…</div></main>
 <div class="toast" id="toast" hidden></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<!-- Supabase's client library, copied into this repo (vendor/README.md) so no outside server can change the code this page runs. -->
+<script src="vendor/supabase-js-2.45.4.js"></script>
 <script src="config.js"></script>
 <script src="app.js"></script>
 </body>
