@@ -1,0 +1,29 @@
+name: Security tests
+# Runs the database permission tests on every change, against a throwaway
+# Postgres inside GitHub (free for public repos). It never touches the real
+# Supabase project and needs no secrets.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  database-rules:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Intern accounts cannot read restricted data
+        run: tests/run.sh
